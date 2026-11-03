@@ -66,7 +66,8 @@ class JevModel(nn.Module):
         h = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
                           output_hidden_states=True, use_cache=False).hidden_states[-1]
         idx = attention_mask.sum(1).clamp_min(1).sub(1).long()
-        return self.head(h[torch.arange(h.size(0), device=h.device), idx])
+        pooled = h[torch.arange(h.size(0), device=h.device), idx].float()  # heads are fp32
+        return self.head(pooled)
 
 
 def main():
@@ -112,31 +113,39 @@ def main():
     base = get_peft_model(base, LoraConfig(task_type=TaskType.CAUSAL_LM, r=R, lora_alpha=ALPHA,
                                            lora_dropout=DROP, target_modules=TARGETS, bias="none"))
     base.print_trainable_parameters()
+    found = sorted({n.split(".")[-1] for n, _ in base.named_modules() if "lora_A" in n})
+    print("LoRA target modules matched:", found, flush=True)
+    n_conv = sum(1 for n, _ in base.named_modules() if "lora_A" in n and ("in_proj" in n or "out_proj" in n))
+    print(f"LoRA layers on conv linears: {n_conv} (expect 26 = 13 layers x 2)", flush=True)
     model = JevModel(base, JevHead()).to(dev)
     cw = torch.tensor([1147 / 355, 1147 / 366, 1147 / 426], dtype=torch.float32)
     cw = (cw / cw.sum() * 3).to(dev)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR, weight_decay=WD)
     total = len(dl_tr) * a.epochs // ACCUM
     sched = get_linear_schedule_with_warmup(opt, int(total * 0.1), total)
-    scaler = torch.cuda.amp.GradScaler(enabled=(dev == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(dev == "cuda"))
     os.makedirs(a.out, exist_ok=True)
     best, bad = float("inf"), 0
     for ep in range(1, a.epochs + 1):
         model.train(); opt.zero_grad()
         for i, b in enumerate(dl_tr):
             b = {k: v.to(dev) for k, v in b.items()}
-            with torch.cuda.amp.autocast(enabled=(dev == "cuda"), dtype=torch.float16):
+            with torch.amp.autocast("cuda", enabled=(dev == "cuda"), dtype=torch.float16):
                 s, v = model(b["input_ids"], b["attention_mask"])
                 loss = (W_S * F.mse_loss(s, b["score"]) + W_V * F.cross_entropy(v, b["verdict"], weight=cw)) / ACCUM
             scaler.scale(loss).backward()
             if (i + 1) % ACCUM == 0:
-                scaler.step(opt); scaler.update(); sched.step(); opt.zero_grad()
+                prev = scaler.get_scale()
+                scaler.step(opt); scaler.update()
+                if scaler.get_scale() >= prev:   # skip the step if grads overflowed
+                    sched.step()
+                opt.zero_grad()
         model.eval(); se, n = 0.0, 0
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=(dev == "cuda"), dtype=torch.float16):
             for b in dl_va:
                 b = {k: v.to(dev) for k, v in b.items()}
                 s, _ = model(b["input_ids"], b["attention_mask"])
-                se += F.mse_loss(s, b["score"], reduction="sum").item(); n += len(s)
+                se += F.mse_loss(s.float(), b["score"], reduction="sum").item(); n += len(s)
         mae = (se / n) ** 0.5
         print(f"epoch {ep}: valid MAE {mae:.4f} (best {best:.4f})", flush=True)
         if mae < best - 1e-4:

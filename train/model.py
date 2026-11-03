@@ -35,7 +35,7 @@ class JevModel(nn.Module):
         )
         h = out.hidden_states[-1]                       # (B, T, H)
         idx = attention_mask.sum(1).clamp_min(1).sub(1).long()  # last real token
-        last = h[torch.arange(h.size(0), device=h.device), idx]  # (B, H)
+        last = h[torch.arange(h.size(0), device=h.device), idx].float()  # heads are fp32
         return self.head(last)
 
 
@@ -69,10 +69,12 @@ def predict(texts, tokenizer, model, *, max_len: int = 512, batch: int = 8,
     import torch.nn.functional as F
     model.eval()
     scores, verdicts = [], []
+    amp = torch.amp.autocast("cuda", enabled=(device == "cuda"), dtype=torch.float16)
     for i in range(0, len(texts), batch):
         enc = tokenizer(texts[i:i + batch], truncation=True, max_length=max_len,
                         padding=True, return_tensors="pt").to(device)
-        s, v = model(enc["input_ids"], enc["attention_mask"])
+        with amp:
+            s, v = model(enc["input_ids"], enc["attention_mask"])
         scores += s.float().cpu().tolist()
         verdicts += v.argmax(-1).cpu().tolist()
     conf = [round(2 * abs(s - 0.5), 3) for s in scores]
