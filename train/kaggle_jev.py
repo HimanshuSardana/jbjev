@@ -4,7 +4,9 @@
 # Setup:
 #   1. Kaggle notebook, GPU T4 x2 ON, internet ON
 #   2. Add this repo's data/ as a Kaggle dataset (or `!git clone <repo>`), so data/*.jsonl exist
-#   3. Cell 1:  !pip install -q "transformers>=5" peft accelerate scikit-learn
+#   3. Cell 1:  !pip uninstall -y torchao && !pip install -q "transformers>=5" peft accelerate scikit-learn
+#      (Kaggle's torchao 0.10 is below peft's required 0.16 and makes peft raise instead of
+#       falling back to plain LoRA. We never use torchao — remove it.)
 #   4. Cell 2:  paste THIS FILE (or !python train/kaggle_jev.py --data data --out /kaggle/working/out)
 #
 # What it does: frozen LFM3-Base + LoRA (attn + conv linears) + score/verdict heads,
@@ -91,10 +93,22 @@ def main():
     dl_va = DataLoader(PairDS(va, tok), batch_size=BATCH * 2, collate_fn=coll)
 
     print("loading backbone (fp16, frozen)...", flush=True)
-    base = AutoModelForCausalLM.from_pretrained(a.model, trust_remote_code=True, torch_dtype=torch.float16)
+    try:
+        base = AutoModelForCausalLM.from_pretrained(a.model, trust_remote_code=True, dtype=torch.float16)
+    except TypeError:  # transformers < 4.56
+        base = AutoModelForCausalLM.from_pretrained(a.model, trust_remote_code=True, torch_dtype=torch.float16)
     if hasattr(base, "gradient_checkpointing_enable"): base.gradient_checkpointing_enable()
     for p in base.parameters(): p.requires_grad = False
     from peft import LoraConfig, get_peft_model, TaskType
+    try:  # torchao below peft's floor makes the LoRA dispatcher raise instead of falling back
+        import torchao  # noqa: F401
+        from peft.import_utils import is_torchao_available
+        if not is_torchao_available():
+            raise ImportError("torchao incompatible")
+    except ImportError:
+        pass  # fine: plain LoRA path
+    except Exception:
+        raise SystemExit("torchao present but incompatible with peft. Run: pip uninstall -y torchao")
     base = get_peft_model(base, LoraConfig(task_type=TaskType.CAUSAL_LM, r=R, lora_alpha=ALPHA,
                                            lora_dropout=DROP, target_modules=TARGETS, bias="none"))
     base.print_trainable_parameters()

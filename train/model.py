@@ -41,9 +41,10 @@ class JevModel(nn.Module):
 
 def build_backbone(model_id: str, *, gradient_checkpointing: bool = True):
     """Load LFM3 (custom code) in fp16 for T4. Freeze base; embeddings stay frozen (tied)."""
-    m = AutoModelForCausalLM.from_pretrained(
-        model_id, trust_remote_code=True, torch_dtype=torch.float16,
-    )
+    try:
+        m = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, dtype=torch.float16)
+    except TypeError:  # transformers < 4.56
+        m = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True, torch_dtype=torch.float16)
     if gradient_checkpointing and hasattr(m, "gradient_checkpointing_enable"):
         m.gradient_checkpointing_enable()
     for p in m.parameters():
