@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+out/
+*.pt
+.kaggle/
+.ipynb_checkpoints/
