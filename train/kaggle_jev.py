@@ -28,7 +28,7 @@ MAX_LEN = 512
 TEMPLATE = "Premise: {resume}\nHypothesis: this candidate matches the job: {job}\nAnswer: score"
 R, ALPHA, DROP = 16, 32, 0.05
 TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj", "out_proj"]
-W_S, W_V, LR, WD, BATCH, ACCUM, EPOCHS, PATIENCE, SEED = 0.7, 0.3, 2e-4, 0.01, 8, 4, 5, 2, 4242
+W_S, W_V, LR, WD, BATCH, ACCUM, EPOCHS, PATIENCE, SEED = 0.7, 0.3, 5e-4, 0.01, 8, 4, 12, 3, 4242
 
 
 def split_row(t: str):
@@ -113,10 +113,12 @@ def main():
     base = get_peft_model(base, LoraConfig(task_type=TaskType.CAUSAL_LM, r=R, lora_alpha=ALPHA,
                                            lora_dropout=DROP, target_modules=TARGETS, bias="none"))
     base.print_trainable_parameters()
-    found = sorted({n.split(".")[-1] for n, _ in base.named_modules() if "lora_A" in n})
-    print("LoRA target modules matched:", found, flush=True)
-    n_conv = sum(1 for n, _ in base.named_modules() if "lora_A" in n and ("in_proj" in n or "out_proj" in n))
-    print(f"LoRA layers on conv linears: {n_conv} (expect 26 = 13 layers x 2)", flush=True)
+    parents = {n.rsplit(".lora_A", 1)[0].rsplit(".", 1)[-1]
+               for n, _ in base.named_modules() if ".lora_A" in n}
+    print("LoRA parent modules:", sorted(parents), flush=True)
+    n_conv = sum(1 for n, _ in base.named_modules()
+                 if ".lora_A" in n and ("in_proj" in n or "out_proj" in n))
+    print(f"LoRA on conv linears: {n_conv} (13 in_proj + 13 out_proj = 26)", flush=True)
     model = JevModel(base, JevHead()).to(dev)
     cw = torch.tensor([1147 / 355, 1147 / 366, 1147 / 426], dtype=torch.float32)
     cw = (cw / cw.sum() * 3).to(dev)
@@ -128,11 +130,14 @@ def main():
     best, bad = float("inf"), 0
     for ep in range(1, a.epochs + 1):
         model.train(); opt.zero_grad()
+        tr_se, tr_n = 0.0, 0
         for i, b in enumerate(dl_tr):
             b = {k: v.to(dev) for k, v in b.items()}
             with torch.amp.autocast("cuda", enabled=(dev == "cuda"), dtype=torch.float16):
                 s, v = model(b["input_ids"], b["attention_mask"])
                 loss = (W_S * F.mse_loss(s, b["score"]) + W_V * F.cross_entropy(v, b["verdict"], weight=cw)) / ACCUM
+            with torch.no_grad():
+                tr_se += F.mse_loss(s.float(), b["score"], reduction="sum").item(); tr_n += len(s)
             scaler.scale(loss).backward()
             if (i + 1) % ACCUM == 0:
                 prev = scaler.get_scale()
@@ -147,7 +152,7 @@ def main():
                 s, _ = model(b["input_ids"], b["attention_mask"])
                 se += F.mse_loss(s.float(), b["score"], reduction="sum").item(); n += len(s)
         mae = (se / n) ** 0.5
-        print(f"epoch {ep}: valid MAE {mae:.4f} (best {best:.4f})", flush=True)
+        print(f"epoch {ep}: train MAE {tr_se / max(1, tr_n):.4f} | valid MAE {mae:.4f} (best {best:.4f})", flush=True)
         if mae < best - 1e-4:
             best, bad = mae, 0
             torch.save({"lora": base.state_dict(), "head": model.head.state_dict(), "tok": a.model, "mae": mae},
