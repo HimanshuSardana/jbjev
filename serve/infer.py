@@ -1,0 +1,95 @@
+"""Fast CPU inference: int8 dynamic quant + warmup + batched predict.
+
+    from serve.infer import Matcher
+    m = Matcher("out/best.pt")
+    m.score([("resume text", "job text"), ...])   -> [{"score":..,"verdict":..,"apply":..,"confidence":..}]
+
+Design notes:
+  * int8 dynamic quant on nn.Linear — 3-4x faster matmul on CPU, ~2.5x smaller RSS.
+    Accuracy cost on this head is small; verify with train/bench.py --int8 before shipping.
+  * dynamic padding: we pad to the longest row in the batch, never to max_len.
+  * torch.set_num_threads() pinned to physical cores; oversubscribing hurts.
+  * warmup matters: first call pays lazy-init and quant kernel selection.
+"""
+from __future__ import annotations
+import os
+import torch
+
+from train import config as C
+from train.data import split_row, to_prompt
+from train.model import JevHead, JevModel, build_backbone, apply_lora
+
+
+class Matcher:
+    def __init__(self, ckpt: str, model_id: str = C.MODEL_ID, int8: bool = True,
+                 threads: int | None = None, max_len: int = 256):
+        threads = threads or max(1, (os.cpu_count() or 4))
+        torch.set_num_threads(threads)
+        torch.set_grad_enabled(False)
+        self.max_len = max_len
+
+        from transformers import AutoTokenizer
+        ck = torch.load(ckpt, map_location="cpu")
+        mid = ck.get("tok", model_id)
+        self.tok = AutoTokenizer.from_pretrained(mid, trust_remote_code=True)
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token
+        self.tok.padding_side = "right"
+
+        base = build_backbone(mid, gradient_checkpointing=False)
+        base = apply_lora(base, C.LORA_R, C.LORA_ALPHA, C.LORA_DROPOUT, C.LORA_TARGETS)
+        base.load_state_dict(ck["lora"], strict=False)
+        head = JevHead()
+        head.load_state_dict(ck["head"])
+        model = JevModel(base, head).eval()
+        if int8:
+            model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+        self.model = model
+        self.int8 = int8
+        self._warm()
+
+    def _warm(self):
+        dummy = to_prompt("Python, SQL", "Backend Engineer. 2+ yrs.", C.TEMPLATE)
+        for _ in range(2):
+            self._forward([dummy])
+
+    def _forward(self, prompts):
+        enc = self.tok(prompts, truncation=True, max_length=self.max_len,
+                       padding=True, return_tensors="pt")
+        with torch.inference_mode():
+            s, v = self.model(enc["input_ids"], enc["attention_mask"])
+        return s.float().tolist(), v.argmax(-1).tolist()
+
+    def score(self, pairs, batch: int = 16):
+        """pairs: list of (resume, job) or raw 'resume: ...\\n[SEP]\\njob: ...' strings."""
+        prompts = []
+        for p in pairs:
+            if isinstance(p, str):
+                prompts.append(to_prompt(*split_row(p), C.TEMPLATE))
+            else:
+                prompts.append(to_prompt(p[0], p[1], C.TEMPLATE))
+        out = []
+        for i in range(0, len(prompts), batch):
+            ss, vv = self._forward(prompts[i:i + batch])
+            for s, v in zip(ss, vv):
+                out.append({
+                    "score": round(s, 3),
+                    "verdict": v,
+                    "apply": int(s >= 0.50),
+                    "confidence": round(2 * abs(s - 0.50), 3),
+                })
+        return out
+
+
+if __name__ == "__main__":
+    import sys, time, json
+    m = Matcher(sys.argv[1] if len(sys.argv) > 1 else "out/best.pt")
+    demo = [
+        ("Python, Django, Postgres, 3 yrs backend", "Backend Engineer. Python, Django, Postgres. 2+ yrs."),
+        ("Photoshop, Illustrator, print design", "Backend Engineer. Python, Django, Postgres. 2+ yrs."),
+    ]
+    t0 = time.perf_counter()
+    r = m.score(demo)
+    dt = (time.perf_counter() - t0) * 1000
+    print(json.dumps(r, indent=2))
+    print(f"2 pairs in {dt:.0f} ms (int8={m.int8}, threads={torch.get_num_threads()})")
