@@ -18,6 +18,7 @@ VALID first, then sweep thresholds on the recalibrated scale.
 """
 from __future__ import annotations
 import argparse, json, os, random, statistics
+from collections import Counter
 import numpy as np
 import torch
 import torch.nn as nn
@@ -156,6 +157,8 @@ def main():
     ap.add_argument("--data", default="data"); ap.add_argument("--out", default="out_distil")
     ap.add_argument("--eval", default=None); ap.add_argument("--ckpt", default=None)
     ap.add_argument("--train-all", action="store_true", help="train on train+valid+test")
+    ap.add_argument("--extra", default=None, help="comma-separated extra training jsonl (domain adaptation)")
+    ap.add_argument("--calib", default=None, help="jsonl to fit recal+thresholds on (default: valid)")
     ap.add_argument("--no-freeze", action="store_true")
     ap.add_argument("--freeze-layers", type=int, default=FREEZE_LAYERS)
     a = ap.parse_args()
@@ -180,6 +183,14 @@ def main():
         print(json.dumps(r, indent=2)); return
 
     tr = load(f"{a.data}/train.jsonl"); va = load(f"{a.data}/valid.jsonl")
+    if a.extra:
+        for f in a.extra.split(","):
+            ex = load(f.strip())
+            print(f"  + {len(ex)} rows from {f.strip()}", flush=True)
+            tr = tr + ex
+    if a.calib:
+        va = load(a.calib)
+        print(f"calibrating on {a.calib} ({len(va)} rows)", flush=True)
     if a.train_all:
         tr = tr + va + load(f"{a.data}/test.jsonl")
         print(f"train-all: {len(tr)} rows (valid/test consumed — eval only on real.jsonl)", flush=True)
@@ -191,7 +202,12 @@ def main():
     trn = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"student {tot/1e6:.1f}M total, {trn/1e6:.1f}M trainable (freeze_emb={not a.no_freeze}, freeze_layers={a.freeze_layers})", flush=True)
 
-    cw = torch.tensor([1.0, 0.97, 0.83], device=dev)
+    cnt = Counter(r["verdict"] for r in tr)
+    tot = sum(cnt.values())
+    cw = torch.tensor([tot / max(1, cnt.get(i, 1)) for i in range(3)], dtype=torch.float32, device=dev)
+    cw = cw.clamp(max=10.0)          # 16 v2 rows in real_train -> raw weight ~75 would explode
+    cw = cw / cw.sum() * 3
+    print(f"train verdicts {dict(sorted(cnt.items()))} -> class weights {[round(float(x),2) for x in cw]}", flush=True)
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=LR, weight_decay=WD)
     total = len(dl_tr) * EPOCHS
