@@ -5,8 +5,12 @@
     m.score([("resume text", "job text"), ...])   -> [{"score":..,"verdict":..,"apply":..,"confidence":..}]
 
 Design notes:
-  * int8 dynamic quant on nn.Linear — 3-4x faster matmul on CPU, ~2.5x smaller RSS.
-    Accuracy cost on this head is small; verify with train/bench.py --int8 before shipping.
+  * int8 dynamic quant is OFF by default. Measured on the 66M student: 41 -> 27 ms/pair
+    but MAE 0.088 -> 0.155, because the isotonic recalibration was fitted on fp32 raw
+    scores and int8 shifts that distribution. Only enable after refitting recal on int8
+    outputs (spearman survives at 0.90, so ranking-only use is safe).
+  * batch=1 is fastest on CPU (41 vs 75 ms/pair at batch 64): dynamic padding plus
+    core saturation make batching a loss here.
   * dynamic padding: we pad to the longest row in the batch, never to max_len.
   * torch.set_num_threads() pinned to physical cores; oversubscribing hurts.
   * warmup matters: first call pays lazy-init and quant kernel selection.
@@ -23,7 +27,7 @@ from train.model import JevHead, JevModel, build_backbone, apply_lora
 class Matcher:
     """Loads either checkpoint type: LFM3 cross-encoder or the DistilBERT student."""
 
-    def __init__(self, ckpt: str, model_id: str = C.MODEL_ID, int8: bool = True,
+    def __init__(self, ckpt: str, model_id: str = C.MODEL_ID, int8: bool = False,
                  threads: int | None = None, max_len: int | None = None):
         # measured on 8-core Kaby Lake: 4 threads beats 8 (hyperthread contention)
         threads = threads or min(4, max(1, (os.cpu_count() or 4)))
@@ -72,7 +76,7 @@ class Matcher:
             s, v = self.model(enc["input_ids"], enc["attention_mask"])
         return s.float().tolist(), v.argmax(-1).tolist()
 
-    def score(self, pairs, batch: int = 16):
+    def score(self, pairs, batch: int = 1):
         """pairs: list of (resume, job) or raw 'resume: ...\\n[SEP]\\njob: ...' strings."""
         prompts = []
         for p in pairs:
