@@ -1,15 +1,20 @@
-"""DistilBERT student: full fine-tune on the rubric labels. CPU-serving target.
+"""DistilBERT student: fine-tune on rubric labels, tuned for CPU serving.
 
-    python train/distil.py --data data --out out_distil
-    python train/distil.py --data data --out out_distil --eval test
-    python train/distil.py --data data --out out_distil --eval real
+    python train/distil.py --data data --out out_distil                    # train
+    python train/distil.py --data data --out out_distil --eval real        # eval one split
+    python train/distil.py --data data --out out_distil --train-all        # final model, all rows
 
-Why not distillation: labels are exact rubric output (2dp). The 1.7B teacher learned
-that same rubric to MAE 0.09 — distilling would copy its error. Train on score directly.
+Measured on target box (8-core Kaby Lake, 4 threads): 35 ms/pair @ 72 tok, 270 MB RSS.
+Real token lengths: p50=72 p99=118 max=137 (train), so max_len=192 covers 100%.
 
-Measured on the target box (8-core Kaby Lake, 4 threads):
-    DistilBERT 66M @ 72 tok = 35 ms/pair, 270 GFLOPS, 270 MB RSS
-    max_len=192 covers p99 (real rows: p50=72 p90=90 p99=131 max=131)
+Anti-overfit defaults (1571 rows vs 66M params is the real constraint):
+  * embeddings frozen           23.4M params — the most memorisation-prone block
+  * bottom 2 of 6 layers frozen  ~14M params
+  -> ~29M trainable instead of 66M
+
+Compression fix: regression heads pull toward the mean on unseen candidates, which is why
+threshold sweeps pin to the grid edge. We fit a linear recalibration (p' = a*p + b) on
+VALID first, then sweep thresholds on the recalibrated scale.
 """
 from __future__ import annotations
 import argparse, json, os, random, statistics
@@ -22,14 +27,15 @@ from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warm
 
 MODEL = "distilbert-base-uncased"
 HIDDEN = 768
-MAX_LEN = 192          # p99 = 131 tokens; 512 was 6.7x wasted compute
+MAX_LEN = 192
 TEMPLATE = "Premise: {resume}\nHypothesis: this candidate matches the job: {job}\nAnswer: score"
-BATCH, LR, WD, EPOCHS, PATIENCE, W_S, W_V, SEED = 32, 2e-5, 0.01, 8, 2, 0.7, 0.3, 4242
+BATCH, LR, WD, EPOCHS, PATIENCE, W_S, W_V, SEED = 32, 3e-5, 0.01, 8, 2, 0.7, 0.3, 4242
+FREEZE_EMB, FREEZE_LAYERS = True, 2
 
 
 def split_row(t: str):
     a, b = t.split("\n[SEP]\n", 1) if "\n[SEP]\n" in t else t.split("[SEP]", 1)
-    a = a.strip(); b = b.strip()
+    a, b = a.strip(), b.strip()
     if a.startswith("resume:"): a = a[7:].strip()
     if b.startswith("job:"): b = b[3:].strip()
     return a, b
@@ -40,8 +46,7 @@ class PairDS(Dataset):
         self.rows, self.tok = rows, tok
     def __len__(self): return len(self.rows)
     def __getitem__(self, i):
-        r = self.rows[i]
-        a, b = split_row(r["text"])
+        r = self.rows[i]; a, b = split_row(r["text"])
         enc = self.tok(TEMPLATE.format(resume=a, job=b), truncation=True, max_length=MAX_LEN)
         return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"],
                 "score": torch.tensor(r["score"], dtype=torch.float32),
@@ -49,18 +54,35 @@ class PairDS(Dataset):
 
 
 class Student(nn.Module):
-    def __init__(self, hidden=HIDDEN):
+    def __init__(self, hidden=HIDDEN, freeze_emb=FREEZE_EMB, freeze_layers=FREEZE_LAYERS):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(MODEL)
-        self.score = nn.Sequential(nn.Linear(hidden, 256), nn.GELU(), nn.Dropout(0.1), nn.Linear(256, 1))
+        self.score = nn.Sequential(nn.Linear(hidden, 256), nn.GELU(), nn.Dropout(0.2), nn.Linear(256, 1))
         self.verdict = nn.Linear(hidden, 3)
+        if freeze_emb:
+            for p in self.encoder.embeddings.parameters():
+                p.requires_grad = False
+        for i, layer in enumerate(self.encoder.transformer.layer):
+            if i < freeze_layers:
+                for p in layer.parameters():
+                    p.requires_grad = False
+
     def forward(self, input_ids, attention_mask):
         h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        cls = h[:, 0]                                   # [CLS]
+        cls = h[:, 0]
         return torch.sigmoid(self.score(cls)).squeeze(-1), self.verdict(cls)
 
 
 def load(f): return [json.loads(l) for l in open(f) if l.strip()]
+
+
+def collate(b, tok):
+    pad = tok.pad_token_id if tok.pad_token_id is not None else 0
+    L = max(len(x["input_ids"]) for x in b)
+    return {"input_ids": torch.tensor([x["input_ids"] + [pad] * (L - len(x["input_ids"])) for x in b]),
+            "attention_mask": torch.tensor([x["attention_mask"] + [0] * (L - len(x["attention_mask"])) for x in b]),
+            "score": torch.stack([x["score"] for x in b]),
+            "verdict": torch.stack([x["verdict"] for x in b])}
 
 
 @torch.no_grad()
@@ -73,6 +95,19 @@ def predict(model, dl, dev):
         ps += s.float().cpu().tolist(); pv += v.argmax(-1).cpu().tolist()
         ts += b["score"].cpu().tolist(); tv += b["verdict"].cpu().tolist()
     return ps, pv, ts, tv
+
+
+def fit_recal(ps, ts):
+    """Least-squares p' = a*p + b, clipped to [0,1]. Fixes mean-reversion on unseen data."""
+    p, t = np.asarray(ps, dtype=float), np.asarray(ts, dtype=float)
+    A = np.vstack([p, np.ones_like(p)]).T
+    a, b = np.linalg.lstsq(A, t, rcond=None)[0]
+    return float(a), float(b)
+
+
+def apply_recal(ps, ab):
+    a, b = ab
+    return [min(1.0, max(0.0, a * p + b)) for p in ps]
 
 
 def metrics(ps, pv, ts, tv, thr=(0.40, 0.70, 0.50)):
@@ -98,19 +133,18 @@ def metrics(ps, pv, ts, tv, thr=(0.40, 0.70, 0.50)):
     mp, mt = statistics.fmean(rp), statistics.fmean(rt)
     cov = sum((a - mp) * (b - mt) for a, b in zip(rp, rt))
     sp = cov / ((sum((a - mp) ** 2 for a in rp) * sum((b - mt) ** 2 for b in rt)) ** 0.5 + 1e-9)
-    edge = [(p, t) for p, t in zip(ps, ts) if any(abs(t - x) <= 0.05 for x in (0.40, 0.50, 0.70))]
-    eacc = sum(1 for p, t in edge if (0 if p < t1 else 1 if p < t2 else 2) ==
-               (0 if t < 0.40 else 1 if t < 0.70 else 2)) / max(1, len(edge))
+    q = lambda xs, x: sorted(xs)[min(len(xs) - 1, int(x * len(xs)))]
     return {"mae": round(mae, 4), "band_acc": round(acc, 4), "apply_f1": round(f1, 4),
-            "spearman": round(sp, 4), "boundary_n": len(edge), "boundary_acc": round(eacc, 4),
-            "mean_pred": round(statistics.fmean(ps), 3)}
+            "spearman": round(sp, 4),
+            "pred_p10": round(q(ps, .1), 3), "pred_p50": round(q(ps, .5), 3), "pred_p90": round(q(ps, .9), 3),
+            "true_p10": round(q(ts, .1), 3), "true_p50": round(q(ts, .5), 3), "true_p90": round(q(ts, .9), 3),
+            "pred_sd": round(statistics.pstdev(ps), 3), "true_sd": round(statistics.pstdev(ts), 3)}
 
 
-def calibrate(ps, tv, grid=(0.30, 0.50, 0.60, 0.80)):
-    """Sweep the two band thresholds on VALID only. Returns (t1, t2, best_acc)."""
+def calibrate(ps, tv):
     best, bt = -1, (0.40, 0.70)
-    for t1 in np.arange(grid[0], grid[1], 0.01):
-        for t2 in np.arange(grid[2], grid[3], 0.01):
+    for t1 in np.arange(0.20, 0.55, 0.01):
+        for t2 in np.arange(0.55, 0.90, 0.01):
             if t2 <= t1 + 0.05: continue
             acc = sum((0 if p < t1 else 1 if p < t2 else 2) == v for p, v in zip(ps, tv)) / len(ps)
             if acc > best: best, bt = acc, (round(float(t1), 2), round(float(t2), 2))
@@ -120,36 +154,46 @@ def calibrate(ps, tv, grid=(0.30, 0.50, 0.60, 0.80)):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data"); ap.add_argument("--out", default="out_distil")
-    ap.add_argument("--eval", default=None, help="test | real | valid")
-    ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--eval", default=None); ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--train-all", action="store_true", help="train on train+valid+test")
+    ap.add_argument("--no-freeze", action="store_true")
+    ap.add_argument("--freeze-layers", type=int, default=FREEZE_LAYERS)
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(SEED); random.seed(SEED); np.random.seed(SEED)
-    torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2) if dev == "cpu" else 8)
-
+    torch.set_num_threads(min(4, os.cpu_count() or 4) if dev == "cpu" else 8)
     tok = AutoTokenizer.from_pretrained(MODEL)
     os.makedirs(a.out, exist_ok=True)
 
-    if a.eval:  # evaluation-only path
+    if a.eval:
         ck = torch.load(a.ckpt or f"{a.out}/best.pt", map_location=dev)
-        m = Student(); m.load_state_dict(ck["model"]); m.to(dev)
+        m = Student(freeze_emb=False, freeze_layers=0)
+        m.load_state_dict(ck["model"]); m.to(dev)
         dl = DataLoader(PairDS(load(f"{a.data}/{a.eval}.jsonl"), tok), batch_size=64,
                         collate_fn=lambda b: collate(b, tok))
         ps, pv, ts, tv = predict(m, dl, dev)
+        if ck.get("recal"):
+            ps = apply_recal(ps, ck["recal"])
         r = metrics(ps, pv, ts, tv, ck.get("thr", (0.40, 0.70, 0.50)))
-        r["split"] = a.eval; r["n"] = len(ps); r["thr"] = ck.get("thr")
+        r.update(split=a.eval, n=len(ps), thr=ck.get("thr"), recal=ck.get("recal"),
+                 ckpt_mae=round(ck.get("mae", -1), 4))
         print(json.dumps(r, indent=2)); return
 
-    tr, va = load(f"{a.data}/train.jsonl"), load(f"{a.data}/valid.jsonl")
-    dl_tr = DataLoader(PairDS(tr, tok), batch_size=BATCH, shuffle=True,
-                       collate_fn=lambda b: collate(b, tok))
+    tr = load(f"{a.data}/train.jsonl"); va = load(f"{a.data}/valid.jsonl")
+    if a.train_all:
+        tr = tr + va + load(f"{a.data}/test.jsonl")
+        print(f"train-all: {len(tr)} rows (valid/test consumed — eval only on real.jsonl)", flush=True)
+    dl_tr = DataLoader(PairDS(tr, tok), batch_size=BATCH, shuffle=True, collate_fn=lambda b: collate(b, tok))
     dl_va = DataLoader(PairDS(va, tok), batch_size=64, collate_fn=lambda b: collate(b, tok))
 
-    model = Student().to(dev)
-    n = sum(p.numel() for p in model.parameters())
-    print(f"student params: {n/1e6:.1f}M  max_len={MAX_LEN}", flush=True)
-    cw = torch.tensor([1.0, 0.97, 0.83], device=dev)  # from train verdict counts 355/366/426
-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
+    model = Student(freeze_emb=not a.no_freeze, freeze_layers=a.freeze_layers).to(dev)
+    tot = sum(p.numel() for p in model.parameters())
+    trn = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"student {tot/1e6:.1f}M total, {trn/1e6:.1f}M trainable (freeze_emb={not a.no_freeze}, freeze_layers={a.freeze_layers})", flush=True)
+
+    cw = torch.tensor([1.0, 0.97, 0.83], device=dev)
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=LR, weight_decay=WD)
     total = len(dl_tr) * EPOCHS
     sched = get_linear_schedule_with_warmup(opt, int(total * 0.06), total)
     scaler = torch.amp.GradScaler("cuda", enabled=(dev == "cuda"))
@@ -162,33 +206,25 @@ def main():
             with torch.amp.autocast("cuda", enabled=(dev == "cuda"), dtype=torch.float16):
                 s, v = model(b["input_ids"], b["attention_mask"])
                 loss = W_S * F.mse_loss(s, b["score"]) + W_V * F.cross_entropy(v, b["verdict"], weight=cw)
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-            sched.step(); opt.zero_grad()
+            scaler.scale(loss).backward(); scaler.step(opt); scaler.update(); sched.step(); opt.zero_grad()
             with torch.no_grad():
                 se += F.mse_loss(s.float(), b["score"], reduction="sum").item(); cnt += len(s)
         ps, pv, ts, tv = predict(model, dl_va, dev)
-        mae = statistics.fmean(abs(p - t) for p, t in zip(ps, ts))
-        print(f"epoch {ep}: train MAE {se/cnt:.4f} | valid MAE {mae:.4f} (best {best:.4f})", flush=True)
+        ab = fit_recal(ps, ts)
+        ps_r = apply_recal(ps, ab)
+        mae = statistics.fmean(abs(p - t) for p, t in zip(ps_r, ts))
+        print(f"epoch {ep}: train MAE {se/cnt:.4f} | valid MAE {mae:.4f} raw {statistics.fmean(abs(p-t) for p,t in zip(ps,ts)):.4f} (best {best:.4f})", flush=True)
         if mae < best - 1e-4:
             best, bad = mae, 0
-            t1, t2, bacc = calibrate(ps, tv)
-            torch.save({"model": model.state_dict(), "tok": MODEL, "arch": "distilbert",
-                        "mae": mae, "thr": (t1, t2, 0.50), "band_acc_cal": bacc,
-                        "max_len": MAX_LEN}, f"{a.out}/best.pt")
-            print(f"  saved (thr={t1}/{t2}, cal band acc {bacc})", flush=True)
+            t1, t2, bacc = calibrate(ps_r, tv)
+            torch.save({"model": model.state_dict(), "tok": MODEL, "arch": "distilbert", "mae": mae,
+                        "thr": (t1, t2, 0.50), "recal": ab, "band_acc_cal": bacc,
+                        "max_len": MAX_LEN, "train_all": a.train_all}, f"{a.out}/best.pt")
+            print(f"  saved recal=({ab[0]:.3f},{ab[1]:.3f}) thr={t1}/{t2} band_acc={bacc}", flush=True)
         else:
             bad += 1
             if bad >= PATIENCE: print("early stop"); break
     print("best valid MAE:", round(best, 4))
-
-
-def collate(b, tok):
-    pad = tok.pad_token_id if tok.pad_token_id is not None else 0
-    L = max(len(x["input_ids"]) for x in b)
-    return {"input_ids": torch.tensor([x["input_ids"] + [pad] * (L - len(x["input_ids"])) for x in b]),
-            "attention_mask": torch.tensor([x["attention_mask"] + [0] * (L - len(x["attention_mask"])) for x in b]),
-            "score": torch.stack([x["score"] for x in b]),
-            "verdict": torch.stack([x["verdict"] for x in b])}
 
 
 if __name__ == "__main__":
