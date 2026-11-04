@@ -21,27 +21,38 @@ from train.model import JevHead, JevModel, build_backbone, apply_lora
 
 
 class Matcher:
+    """Loads either checkpoint type: LFM3 cross-encoder or the DistilBERT student."""
+
     def __init__(self, ckpt: str, model_id: str = C.MODEL_ID, int8: bool = True,
-                 threads: int | None = None, max_len: int = 256):
-        threads = threads or max(1, (os.cpu_count() or 4))
+                 threads: int | None = None, max_len: int | None = None):
+        # measured on 8-core Kaby Lake: 4 threads beats 8 (hyperthread contention)
+        threads = threads or min(4, max(1, (os.cpu_count() or 4)))
         torch.set_num_threads(threads)
         torch.set_grad_enabled(False)
-        self.max_len = max_len
 
         from transformers import AutoTokenizer
         ck = torch.load(ckpt, map_location="cpu")
         mid = ck.get("tok", model_id)
-        self.tok = AutoTokenizer.from_pretrained(mid, trust_remote_code=True)
+        self.arch = ck.get("arch", "lfm3")
+        self.thr = ck.get("thr", (0.40, 0.70, 0.50))   # calibrated on valid
+        self.max_len = max_len or ck.get("max_len", 192 if self.arch == "distilbert" else 256)
+
+        self.tok = AutoTokenizer.from_pretrained(mid, trust_remote_code=(self.arch == "lfm3"))
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token
         self.tok.padding_side = "right"
 
-        base = build_backbone(mid, gradient_checkpointing=False)
-        base = apply_lora(base, C.LORA_R, C.LORA_ALPHA, C.LORA_DROPOUT, C.LORA_TARGETS)
-        base.load_state_dict(ck["lora"], strict=False)
-        head = JevHead()
-        head.load_state_dict(ck["head"])
-        model = JevModel(base, head).eval()
+        if self.arch == "distilbert":
+            from train.distil import Student
+            model = Student()
+            model.load_state_dict(ck["model"])
+        else:
+            base = build_backbone(mid, gradient_checkpointing=False)
+            base = apply_lora(base, C.LORA_R, C.LORA_ALPHA, C.LORA_DROPOUT, C.LORA_TARGETS)
+            base.load_state_dict(ck["lora"], strict=False)
+            head = JevHead(); head.load_state_dict(ck["head"])
+            model = JevModel(base, head)
+        model = model.eval()
         if int8:
             model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
         self.model = model
@@ -71,11 +82,12 @@ class Matcher:
         out = []
         for i in range(0, len(prompts), batch):
             ss, vv = self._forward(prompts[i:i + batch])
+            t1, t2, ta = self.thr
             for s, v in zip(ss, vv):
                 out.append({
                     "score": round(s, 3),
-                    "verdict": v,
-                    "apply": int(s >= 0.50),
+                    "verdict": 0 if s < t1 else 1 if s < t2 else 2,
+                    "apply": int(s >= ta),
                     "confidence": round(2 * abs(s - 0.50), 3),
                 })
         return out
