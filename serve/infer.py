@@ -88,7 +88,16 @@ class Matcher:
             rec = self.recal
             for s, v in zip(ss, vv):
                 if rec and rec[0] == "iso":
-                    s = float(_np.interp(s, rec[1], rec[2]))
+                    xs, ys = _np.asarray(rec[1]), _np.asarray(rec[2])
+                    if s < xs[0]:
+                        k = min(3, len(xs) - 1)
+                        s = ys[0] + (ys[k] - ys[0]) / max(1e-6, xs[k] - xs[0]) * (s - xs[0])
+                    elif s > xs[-1]:
+                        k = min(3, len(xs) - 1)
+                        s = ys[-1] + (ys[-1] - ys[-1 - k]) / max(1e-6, xs[-1] - xs[-1 - k]) * (s - xs[-1])
+                    else:
+                        s = float(_np.interp(s, xs, ys))
+                    s = float(min(1.0, max(0.0, s)))
                 elif rec:
                     s = min(1.0, max(0.0, rec[1] * s + rec[2]))
                 out.append({

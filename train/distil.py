@@ -118,7 +118,20 @@ def apply_recal(ps, rec):
     if not rec:
         return list(ps)
     if rec[0] == "iso":
-        return list(np.interp(ps, rec[1], rec[2]))
+        xs, ys = np.asarray(rec[1]), np.asarray(rec[2])
+        out = np.interp(ps, xs, ys)
+        # linear extrapolation past the outermost knots instead of clamping flat
+        lo = np.asarray(ps) < xs[0]
+        hi = np.asarray(ps) > xs[-1]
+        if lo.any():
+            k = min(3, len(xs) - 1)
+            sl = (ys[k] - ys[0]) / max(1e-6, xs[k] - xs[0])
+            out[lo] = ys[0] + sl * (np.asarray(ps)[lo] - xs[0])
+        if hi.any():
+            k = min(3, len(xs) - 1)
+            sl = (ys[-1] - ys[-1 - k]) / max(1e-6, xs[-1] - xs[-1 - k])
+            out[hi] = ys[-1] + sl * (np.asarray(ps)[hi] - xs[-1])
+        return [float(min(1.0, max(0.0, v))) for v in out]
     _, a, b = rec
     return [min(1.0, max(0.0, a * p + b)) for p in ps]
 
@@ -170,7 +183,9 @@ def main():
     ap.add_argument("--eval", default=None); ap.add_argument("--ckpt", default=None)
     ap.add_argument("--train-all", action="store_true", help="train on train+valid+test")
     ap.add_argument("--extra", default=None, help="comma-separated extra training jsonl (domain adaptation)")
-    ap.add_argument("--calib", default=None, help="jsonl to fit recal+thresholds on (default: valid)")
+    ap.add_argument("--calib", default=None,
+                    help="jsonl(s) to fit recal+thresholds on, comma-separated (default: valid). "
+                         "MUST span the full label range or isotonic clamps the tails.")
     ap.add_argument("--no-freeze", action="store_true")
     ap.add_argument("--freeze-layers", type=int, default=FREEZE_LAYERS)
     a = ap.parse_args()
@@ -201,8 +216,14 @@ def main():
             print(f"  + {len(ex)} rows from {f.strip()}", flush=True)
             tr = tr + ex
     if a.calib:
-        va = load(a.calib)
-        print(f"calibrating on {a.calib} ({len(va)} rows)", flush=True)
+        va = []
+        for f in a.calib.split(","):
+            part = load(f.strip()); va += part
+            print(f"  calib: {len(part)} rows from {f.strip()}", flush=True)
+        sc = [r["score"] for r in va]
+        print(f"calibrating on {len(va)} rows, label range {min(sc):.2f}-{max(sc):.2f}", flush=True)
+        if max(sc) - min(sc) < 0.5:
+            print("  WARNING: calib labels span <0.5. Isotonic will clamp the tails.", flush=True)
     if a.train_all:
         tr = tr + va + load(f"{a.data}/test.jsonl")
         print(f"train-all: {len(tr)} rows (valid/test consumed — eval only on real.jsonl)", flush=True)
