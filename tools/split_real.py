@@ -14,6 +14,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data")
     ap.add_argument("--eval-frac", type=float, default=0.2)
+    ap.add_argument("--calib-frac", type=float, default=0.15)
     ap.add_argument("--seed", type=int, default=7)
     a = ap.parse_args()
 
@@ -25,12 +26,17 @@ def main():
     random.Random(a.seed).shuffle(keys)
 
     n_eval = max(1, round(len(keys) * a.eval_frac))
-    eval_jds, train_jds = set(keys[:n_eval]), set(keys[n_eval:])
+    n_calib = max(1, round(len(keys) * a.calib_frac))
+    eval_jds = set(keys[:n_eval])
+    calib_jds = set(keys[n_eval:n_eval + n_calib])
+    train_jds = set(keys[n_eval + n_calib:])
     tr = [r for k in train_jds for r in groups[k]]
+    ca = [r for k in calib_jds for r in groups[k]]
     ev = [r for k in eval_jds for r in groups[k]]
-    random.Random(a.seed).shuffle(tr); random.Random(a.seed + 1).shuffle(ev)
+    random.Random(a.seed).shuffle(tr)
+    random.Random(a.seed + 1).shuffle(ca); random.Random(a.seed + 2).shuffle(ev)
 
-    for name, rs in (("real_train", tr), ("real_eval", ev)):
+    for name, rs in (("real_train", tr), ("real_calib", ca), ("real_eval", ev)):
         with open(f"{a.data}/{name}.jsonl", "w") as f:
             for r in rs:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -39,7 +45,8 @@ def main():
             v[r["verdict"]] += 1
         jds = {r["text"].split("[SEP]\njob: ")[-1] for r in rs}
         print(f"{name}: {len(rs):5} rows | {len(jds):3} JDs | verdicts {dict(sorted(v.items()))}")
-    print(f"eval JDs are disjoint from train JDs: {not (eval_jds & train_jds)}")
+    print(f"JD-disjoint: train {len(train_jds)} | calib {len(calib_jds)} | eval {len(eval_jds)} "
+          f"| overlap {len((eval_jds|calib_jds) & train_jds)}")
 
 
 if __name__ == "__main__":

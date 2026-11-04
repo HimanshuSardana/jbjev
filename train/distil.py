@@ -98,16 +98,28 @@ def predict(model, dl, dev):
     return ps, pv, ts, tv
 
 
-def fit_recal(ps, ts):
-    """Least-squares p' = a*p + b, clipped to [0,1]. Fixes mean-reversion on unseen data."""
+def fit_recal(ps, ts, kind="isotonic"):
+    """Map raw predictions to the label scale. Isotonic bends the curve, which is what
+    fixes the model's refusal to predict extremes (pred_p10 0.19 vs true_p10 0.07)."""
     p, t = np.asarray(ps, dtype=float), np.asarray(ts, dtype=float)
+    if kind == "isotonic":
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0).fit(p, t)
+            return ("iso", iso.X_thresholds_.tolist(), iso.y_thresholds_.tolist())
+        except ImportError:
+            pass
     A = np.vstack([p, np.ones_like(p)]).T
     a, b = np.linalg.lstsq(A, t, rcond=None)[0]
-    return float(a), float(b)
+    return ("lin", float(a), float(b))
 
 
-def apply_recal(ps, ab):
-    a, b = ab
+def apply_recal(ps, rec):
+    if not rec:
+        return list(ps)
+    if rec[0] == "iso":
+        return list(np.interp(ps, rec[1], rec[2]))
+    _, a, b = rec
     return [min(1.0, max(0.0, a * p + b)) for p in ps]
 
 
@@ -236,7 +248,8 @@ def main():
             torch.save({"model": model.state_dict(), "tok": MODEL, "arch": "distilbert", "mae": mae,
                         "thr": (t1, t2, 0.50), "recal": ab, "band_acc_cal": bacc,
                         "max_len": MAX_LEN, "train_all": a.train_all}, f"{a.out}/best.pt")
-            print(f"  saved recal=({ab[0]:.3f},{ab[1]:.3f}) thr={t1}/{t2} band_acc={bacc}", flush=True)
+            tag = f"iso[{len(ab[1])}]" if ab[0] == "iso" else f"lin({ab[1]:.3f},{ab[2]:.3f})"
+            print(f"  saved recal={tag} thr={t1}/{t2} band_acc={bacc}", flush=True)
         else:
             bad += 1
             if bad >= PATIENCE: print("early stop"); break

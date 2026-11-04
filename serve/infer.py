@@ -35,7 +35,7 @@ class Matcher:
         mid = ck.get("tok", model_id)
         self.arch = ck.get("arch", "lfm3")
         self.thr = ck.get("thr", (0.40, 0.70, 0.50))   # calibrated on valid
-        self.recal = ck.get("recal", (1.0, 0.0))        # linear de-compression
+        self.recal = ck.get("recal")                     # None | ("lin",a,b) | ("iso",xs,ys)
         self.max_len = max_len or ck.get("max_len", 192 if self.arch == "distilbert" else 256)
 
         self.tok = AutoTokenizer.from_pretrained(mid, trust_remote_code=(self.arch == "lfm3"))
@@ -84,9 +84,13 @@ class Matcher:
         for i in range(0, len(prompts), batch):
             ss, vv = self._forward(prompts[i:i + batch])
             t1, t2, ta = self.thr
-            ra, rb = self.recal
+            import numpy as _np
+            rec = self.recal
             for s, v in zip(ss, vv):
-                s = min(1.0, max(0.0, ra * s + rb))
+                if rec and rec[0] == "iso":
+                    s = float(_np.interp(s, rec[1], rec[2]))
+                elif rec:
+                    s = min(1.0, max(0.0, rec[1] * s + rec[2]))
                 out.append({
                     "score": round(s, 3),
                     "verdict": 0 if s < t1 else 1 if s < t2 else 2,
